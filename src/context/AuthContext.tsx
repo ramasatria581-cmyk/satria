@@ -1,0 +1,142 @@
+import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import { apiFetch, getAuthToken, setAuthToken } from '../lib/api';
+import type { UserProfile } from '../types';
+
+interface AuthContextValue {
+  user: UserProfile | null;
+  loading: boolean;
+  hasUsers: boolean;
+  provider: 'supabase' | 'local';
+  login: (email: string, password: string) => Promise<UserProfile>;
+  registerFirstAdmin: (payload: {
+    email: string;
+    password: string;
+    full_name: string;
+    nip: string;
+    department: string;
+  }) => Promise<UserProfile>;
+  logout: () => Promise<void>;
+  refreshBootstrap: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextValue | null>(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [hasUsers, setHasUsers] = useState(true);
+  const [provider, setProvider] = useState<'supabase' | 'local'>('local');
+
+  const refreshBootstrap = useCallback(async () => {
+    try {
+      const status = await apiFetch<{ hasUsers: boolean; provider: 'supabase' | 'local' }>(
+        '/api/auth/bootstrap-status'
+      );
+      setHasUsers(status.hasUsers);
+      setProvider(status.provider);
+    } catch {
+      // keep existing state
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    async function init() {
+      try {
+        const status = await apiFetch<{ hasUsers: boolean; provider: 'supabase' | 'local' }>(
+          '/api/auth/bootstrap-status'
+        );
+        if (!active) return;
+        setHasUsers(status.hasUsers);
+        setProvider(status.provider);
+
+        const token = getAuthToken();
+        if (token) {
+          try {
+            const me = await apiFetch<{ user: UserProfile; provider: 'supabase' | 'local' }>('/api/auth/me');
+            if (!active) return;
+            setUser(me.user);
+            setProvider(me.provider);
+          } catch {
+            setAuthToken(null);
+            if (active) setUser(null);
+          }
+        }
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    init();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const login = useCallback(async (email: string, password: string) => {
+    const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+    setAuthToken(res.token);
+    setUser(res.user);
+    setHasUsers(true);
+    return res.user;
+  }, []);
+
+  const registerFirstAdmin = useCallback(
+    async (payload: {
+      email: string;
+      password: string;
+      full_name: string;
+      nip: string;
+      department: string;
+    }) => {
+      const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/register-first', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      setAuthToken(res.token);
+      setUser(res.user);
+      setHasUsers(true);
+      return res.user;
+    },
+    []
+  );
+
+  const logout = useCallback(async () => {
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // ignore network error during logout
+    }
+    setAuthToken(null);
+    setUser(null);
+  }, []);
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        loading,
+        hasUsers,
+        provider,
+        login,
+        registerFirstAdmin,
+        logout,
+        refreshBootstrap,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth(): AuthContextValue {
+  const ctx = useContext(AuthContext);
+  if (!ctx) {
+    throw new Error('useAuth must be used inside AuthProvider');
+  }
+  return ctx;
+}
