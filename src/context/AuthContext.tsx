@@ -1,12 +1,22 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { apiFetch, getAuthToken, setAuthToken } from '../lib/api';
-import type { UserProfile } from '../types';
+import { isClientSupabaseConfigured, supabaseClient } from '../lib/supabase';
+import type { UserProfile, UserRole } from '../types';
+
+interface BootstrapStatus {
+  hasUsers: boolean;
+  provider: 'supabase' | 'local';
+  schemaReady?: boolean;
+  schemaError?: string;
+}
 
 interface AuthContextValue {
   user: UserProfile | null;
   loading: boolean;
   hasUsers: boolean;
   provider: 'supabase' | 'local';
+  schemaReady: boolean;
+  schemaError: string;
   login: (email: string, password: string) => Promise<UserProfile>;
   registerFirstAdmin: (payload: {
     email: string;
@@ -26,14 +36,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [hasUsers, setHasUsers] = useState(true);
   const [provider, setProvider] = useState<'supabase' | 'local'>('local');
+  const [schemaReady, setSchemaReady] = useState(true);
+  const [schemaError, setSchemaError] = useState('');
 
   const refreshBootstrap = useCallback(async () => {
     try {
-      const status = await apiFetch<{ hasUsers: boolean; provider: 'supabase' | 'local' }>(
-        '/api/auth/bootstrap-status'
-      );
+      const status = await apiFetch<BootstrapStatus>('/api/auth/bootstrap-status');
       setHasUsers(status.hasUsers);
       setProvider(status.provider);
+      setSchemaReady(status.schemaReady !== false);
+      setSchemaError(status.schemaError || '');
     } catch {
       // keep existing state
     }
@@ -44,17 +56,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     async function init() {
       try {
-        const status = await apiFetch<{ hasUsers: boolean; provider: 'supabase' | 'local' }>(
-          '/api/auth/bootstrap-status'
-        );
+        const status = await apiFetch<BootstrapStatus>('/api/auth/bootstrap-status');
         if (!active) return;
         setHasUsers(status.hasUsers);
         setProvider(status.provider);
+        setSchemaReady(status.schemaReady !== false);
+        setSchemaError(status.schemaError || '');
 
         const token = getAuthToken();
         if (token) {
           try {
-            const me = await apiFetch<{ user: UserProfile; provider: 'supabase' | 'local' }>('/api/auth/me');
+            const me = await apiFetch<{ user: UserProfile; provider: 'supabase' | 'local' }>(
+              '/api/auth/me'
+            );
             if (!active) return;
             setUser(me.user);
             setProvider(me.provider);
@@ -63,6 +77,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             if (active) setUser(null);
           }
         }
+      } catch (err) {
+        if (!active) return;
+        setSchemaReady(false);
+        setSchemaError(err instanceof Error ? err.message : 'Gagal menghubungi server.');
       } finally {
         if (active) setLoading(false);
       }
@@ -75,14 +93,46 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
-    const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    });
-    setAuthToken(res.token);
-    setUser(res.user);
-    setHasUsers(true);
-    return res.user;
+    try {
+      const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      });
+      setAuthToken(res.token);
+      setUser(res.user);
+      setHasUsers(true);
+      return res.user;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (msg.includes('404') && isClientSupabaseConfigured && supabaseClient) {
+        const { data, error } = await supabaseClient.auth.signInWithPassword({
+          email: email.trim().toLowerCase(),
+          password,
+        });
+        if (error || !data.session || !data.user) {
+          throw new Error(error?.message || 'Email atau password salah.');
+        }
+        const meta = (data.user.user_metadata || {}) as Record<string, string>;
+        const role: UserRole =
+          meta.role === 'admin' || meta.role === 'guru' || meta.role === 'tenaga_kependidikan'
+            ? meta.role
+            : 'admin';
+        const profile: UserProfile = {
+          id: data.user.id,
+          email: data.user.email || email,
+          full_name: meta.full_name || (data.user.email || email).split('@')[0],
+          nip: meta.nip || '',
+          role,
+          department: meta.department || '',
+          created_at: data.user.created_at || new Date().toISOString(),
+        };
+        setAuthToken(data.session.access_token);
+        setUser(profile);
+        setHasUsers(true);
+        return profile;
+      }
+      throw err;
+    }
   }, []);
 
   const registerFirstAdmin = useCallback(
@@ -122,6 +172,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         loading,
         hasUsers,
         provider,
+        schemaReady,
+        schemaError,
         login,
         registerFirstAdmin,
         logout,

@@ -1,6 +1,5 @@
 import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
-import { createServer as createViteServer } from 'vite';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
@@ -22,34 +21,144 @@ interface AuthUser {
 
 interface AuthedRequest extends Request {
   user?: AuthUser;
+  accessToken?: string;
 }
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const VALID_ROLES: UserRole[] = ['admin', 'guru', 'tenaga_kependidikan'];
 const VALID_MAJORS: MajorCode[] = ['TKJ', 'DKV', 'AK', 'BC', 'MPLB', 'BD'];
 
-const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+function cleanEnv(val?: string): string {
+  return (val || '').trim().replace(/^["']|["']$/g, '');
+}
+
+const SUPABASE_URL = cleanEnv(process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL);
+const SUPABASE_ANON_KEY = cleanEnv(process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY);
+const SUPABASE_SERVICE_ROLE_KEY = cleanEnv(process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+const isPlaceholder = (v: string) =>
+  !v ||
+  v.includes('your-project-id') ||
+  v.includes('your-supabase') ||
+  v.startsWith('MY_');
 
 const isSupabaseMode = Boolean(
-  SUPABASE_URL &&
-    SUPABASE_ANON_KEY &&
-    SUPABASE_SERVICE_ROLE_KEY &&
-    !SUPABASE_URL.includes('your-project-id') &&
-    !SUPABASE_SERVICE_ROLE_KEY.includes('your-supabase-service-role-key')
+  !isPlaceholder(SUPABASE_URL) &&
+    !isPlaceholder(SUPABASE_ANON_KEY) &&
+    SUPABASE_URL.startsWith('http')
 );
+
+const hasServiceRoleKey = Boolean(isSupabaseMode && !isPlaceholder(SUPABASE_SERVICE_ROLE_KEY));
 
 let supabaseAdmin: SupabaseClient | null = null;
 let supabaseAnon: SupabaseClient | null = null;
+let adminDbWorks: boolean | null = null;
 
 if (isSupabaseMode) {
-  supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { autoRefreshToken: false, persistSession: false },
-  });
   supabaseAnon = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     auth: { autoRefreshToken: false, persistSession: false },
   });
+  if (hasServiceRoleKey) {
+    supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+  }
+}
+
+function createUserSupabase(accessToken: string): SupabaseClient {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+    global: {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    },
+  });
+}
+
+async function getSupabaseDb(req: AuthedRequest): Promise<SupabaseClient> {
+  if (supabaseAdmin) {
+    if (adminDbWorks === true) return supabaseAdmin;
+    if (adminDbWorks === null) {
+      const { error } = await supabaseAdmin.from('profiles').select('id').limit(1);
+      adminDbWorks = !error;
+      if (adminDbWorks) return supabaseAdmin;
+    }
+  }
+  return createUserSupabase(req.accessToken || '');
+}
+
+async function resolveSupabaseProfile(
+  authUser: { id: string; email?: string; user_metadata?: Record<string, unknown>; created_at?: string },
+  accessToken: string
+): Promise<AuthUser> {
+  const meta = (authUser.user_metadata || {}) as Record<string, string>;
+  const fallbackName = meta.full_name || (authUser.email || '').split('@')[0] || 'Pengguna';
+  const fallbackRole: UserRole = VALID_ROLES.includes(meta.role as UserRole)
+    ? (meta.role as UserRole)
+    : 'admin';
+
+  const clientsToTry: SupabaseClient[] = [];
+  if (supabaseAdmin && adminDbWorks !== false) clientsToTry.push(supabaseAdmin);
+  clientsToTry.push(createUserSupabase(accessToken));
+
+  for (const client of clientsToTry) {
+    const { data: profile, error: profErr } = await client
+      .from('profiles')
+      .select('id, email, full_name, nip, role, department, created_at')
+      .eq('id', authUser.id)
+      .maybeSingle();
+
+    if (profErr) {
+      if (client === supabaseAdmin) adminDbWorks = false;
+      continue;
+    }
+
+    if (profile) {
+      if (client === supabaseAdmin) adminDbWorks = true;
+      return sanitizeUser(profile);
+    }
+
+    // Row does not exist yet in profiles (e.g. created in Supabase Dashboard before trigger)
+    const { count: profCount } = await client
+      .from('profiles')
+      .select('id', { count: 'exact' })
+      .limit(1);
+
+    const assignedRole: UserRole =
+      (profCount ?? 0) === 0
+        ? 'admin'
+        : VALID_ROLES.includes(meta.role as UserRole)
+          ? (meta.role as UserRole)
+          : 'admin';
+
+    const { data: synced } = await client
+      .from('profiles')
+      .upsert({
+        id: authUser.id,
+        email: authUser.email || '',
+        full_name: fallbackName,
+        nip: meta.nip || '',
+        role: assignedRole,
+        department: meta.department || '',
+      })
+      .select('id, email, full_name, nip, role, department, created_at')
+      .maybeSingle();
+
+    if (synced) {
+      return sanitizeUser(synced);
+    }
+  }
+
+  return {
+    id: authUser.id,
+    email: authUser.email || '',
+    full_name: fallbackName,
+    nip: meta.nip || '',
+    role: fallbackRole,
+    department: meta.department || '',
+    created_at: authUser.created_at || new Date().toISOString(),
+  };
 }
 
 // Local SQLite fallback database when Supabase env vars are not yet provided
@@ -198,25 +307,15 @@ async function authenticateRequest(req: AuthedRequest, res: Response, next: Next
   }
 
   try {
-    if (isSupabaseMode && supabaseAdmin) {
-      const { data: authData, error: authErr } = await supabaseAdmin.auth.getUser(token);
+    if (isSupabaseMode && supabaseAnon) {
+      const { data: authData, error: authErr } = await supabaseAnon.auth.getUser(token);
       if (authErr || !authData.user) {
         res.status(401).json({ error: 'Sesi berakhir atau tidak valid.' });
         return;
       }
 
-      const { data: profile, error: profErr } = await supabaseAdmin
-        .from('profiles')
-        .select('id, email, full_name, nip, role, department, created_at')
-        .eq('id', authData.user.id)
-        .single();
-
-      if (profErr || !profile) {
-        res.status(401).json({ error: 'Profil pengguna tidak ditemukan.' });
-        return;
-      }
-
-      req.user = sanitizeUser(profile);
+      req.accessToken = token;
+      req.user = await resolveSupabaseProfile(authData.user, token);
       next();
       return;
     }
@@ -278,23 +377,41 @@ async function startServer() {
 
   app.get('/api/auth/bootstrap-status', async (_req: Request, res: Response) => {
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { count, error } = await supabaseAdmin
-          .from('profiles')
-          .select('*', { count: 'exact', head: true });
-        if (error) {
-          res.status(500).json({ error: error.message });
-          return;
+      if (isSupabaseMode) {
+        if (supabaseAdmin) {
+          const { count, error } = await supabaseAdmin
+            .from('profiles')
+            .select('id', { count: 'exact' })
+            .limit(1);
+
+          if (!error) {
+            adminDbWorks = true;
+            res.json({ hasUsers: (count ?? 0) > 0, provider: 'supabase', schemaReady: true });
+            return;
+          }
+          adminDbWorks = false;
         }
-        res.json({ hasUsers: (count ?? 0) > 0, provider: 'supabase' });
+
+        res.json({
+          hasUsers: false,
+          provider: 'supabase',
+          schemaReady: Boolean(supabaseAdmin && adminDbWorks),
+          schemaError: !supabaseAdmin
+            ? 'SUPABASE_SERVICE_ROLE_KEY belum diatur di Secrets.'
+            : 'SUPABASE_SERVICE_ROLE_KEY tidak memiliki akses admin Auth/Database atau tabel profiles belum siap.',
+        });
         return;
       }
 
       const row = db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
-      res.json({ hasUsers: row.cnt > 0, provider: 'local' });
+      res.json({ hasUsers: row.cnt > 0, provider: 'local', schemaReady: true });
     } catch (err) {
-      console.error('bootstrap-status error:', err);
-      res.status(500).json({ error: 'Gagal memeriksa status sistem.' });
+      res.json({
+        hasUsers: true,
+        provider: isSupabaseMode ? 'supabase' : 'local',
+        schemaReady: false,
+        schemaError: err instanceof Error ? err.message : 'Gagal memeriksa status sistem.',
+      });
     }
   });
 
@@ -316,9 +433,17 @@ async function startServer() {
 
     try {
       if (isSupabaseMode && supabaseAdmin && supabaseAnon) {
-        const { count } = await supabaseAdmin
+        const { count, error: countErr } = await supabaseAdmin
           .from('profiles')
-          .select('*', { count: 'exact', head: true });
+          .select('id', { count: 'exact' })
+          .limit(1);
+
+        if (countErr) {
+          res.status(400).json({
+            error: `Database Supabase belum siap (${countErr.message}). Jalankan file supabase/schema.sql pada SQL Editor Supabase terlebih dahulu.`,
+          });
+          return;
+        }
 
         if ((count ?? 0) > 0) {
           res.status(403).json({ error: 'Akun admin pertama sudah terdaftar. Silakan login.' });
@@ -420,31 +545,29 @@ async function startServer() {
     }
 
     try {
-      if (isSupabaseMode && supabaseAdmin && supabaseAnon) {
+      if (isSupabaseMode && supabaseAnon) {
         const { data, error } = await supabaseAnon.auth.signInWithPassword({
           email: cleanEmail,
           password,
         });
 
         if (error || !data.session || !data.user) {
-          res.status(401).json({ error: 'Email atau password salah.' });
+          const msg = (error?.message || '').toLowerCase();
+          if (msg.includes('email not confirmed')) {
+            res.status(401).json({
+              error:
+                'Email akun belum dikonfirmasi di Supabase Authentication. Silakan konfirmasi email user di Supabase Dashboard.',
+            });
+            return;
+          }
+          res.status(401).json({ error: error?.message || 'Email atau password salah.' });
           return;
         }
 
-        const { data: profile, error: profErr } = await supabaseAdmin
-          .from('profiles')
-          .select('id, email, full_name, nip, role, department, created_at')
-          .eq('id', data.user.id)
-          .single();
-
-        if (profErr || !profile) {
-          res.status(401).json({ error: 'Profil pengguna tidak ditemukan di database.' });
-          return;
-        }
-
+        const profile = await resolveSupabaseProfile(data.user, data.session.access_token);
         res.json({
           token: data.session.access_token,
-          user: sanitizeUser(profile),
+          user: profile,
         });
         return;
       }
@@ -498,19 +621,21 @@ async function startServer() {
     const today = getTodayDateString();
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { data: myToday } = await supabaseAdmin
+      if (isSupabaseMode) {
+        const sb = await getSupabaseDb(req);
+        const { data: myToday } = await sb
           .from('employee_attendance')
           .select('*')
           .eq('user_id', user.id)
           .eq('attendance_date', today)
           .maybeSingle();
 
-        const { count: myMonthCount } = await supabaseAdmin
+        const { count: myMonthCount } = await sb
           .from('employee_attendance')
-          .select('*', { count: 'exact', head: true })
+          .select('id', { count: 'exact' })
           .eq('user_id', user.id)
-          .gte('attendance_date', today.slice(0, 7) + '-01');
+          .gte('attendance_date', today.slice(0, 7) + '-01')
+          .limit(1);
 
         let totalEmployees = 0;
         let employeesPresentToday = 0;
@@ -520,15 +645,17 @@ async function startServer() {
         let recentStudentLogs: unknown[] = [];
 
         if (user.role === 'admin') {
-          const { count: empCount } = await supabaseAdmin
+          const { count: empCount } = await sb
             .from('profiles')
-            .select('*', { count: 'exact', head: true });
-          const { count: empTodayCount } = await supabaseAdmin
+            .select('id', { count: 'exact' })
+            .limit(1);
+          const { count: empTodayCount } = await sb
             .from('employee_attendance')
-            .select('*', { count: 'exact', head: true })
+            .select('id', { count: 'exact' })
             .eq('attendance_date', today)
-            .in('status', ['Hadir', 'Terlambat']);
-          const { data: empLogs } = await supabaseAdmin
+            .in('status', ['Hadir', 'Terlambat'])
+            .limit(1);
+          const { data: empLogs } = await sb
             .from('employee_attendance')
             .select('*, profiles(full_name, email, nip, role, department)')
             .order('created_at', { ascending: false })
@@ -543,15 +670,17 @@ async function startServer() {
         }
 
         if (user.role === 'admin' || user.role === 'guru') {
-          const { count: studCount } = await supabaseAdmin
+          const { count: studCount } = await sb
             .from('students')
-            .select('*', { count: 'exact', head: true });
-          const { count: studTodayCount } = await supabaseAdmin
+            .select('id', { count: 'exact' })
+            .limit(1);
+          const { count: studTodayCount } = await sb
             .from('student_attendance')
-            .select('*', { count: 'exact', head: true })
+            .select('id', { count: 'exact' })
             .eq('attendance_date', today)
-            .eq('status', 'Hadir');
-          const { data: studLogs } = await supabaseAdmin
+            .eq('status', 'Hadir')
+            .limit(1);
+          const { data: studLogs } = await sb
             .from('student_attendance')
             .select('*, students(id, nis, name, class_name, major)')
             .order('created_at', { ascending: false })
@@ -697,15 +826,16 @@ async function startServer() {
     const today = getTodayDateString();
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { data: todayRecord } = await supabaseAdmin
+      if (isSupabaseMode) {
+        const sb = await getSupabaseDb(req);
+        const { data: todayRecord } = await sb
           .from('employee_attendance')
           .select('*')
           .eq('user_id', user.id)
           .eq('attendance_date', today)
           .maybeSingle();
 
-        const { data: history, error } = await supabaseAdmin
+        const { data: history, error } = await sb
           .from('employee_attendance')
           .select('*')
           .eq('user_id', user.id)
@@ -744,8 +874,9 @@ async function startServer() {
     const nowIso = new Date().toISOString();
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { data: existing } = await supabaseAdmin
+      if (isSupabaseMode) {
+        const sb = await getSupabaseDb(req);
+        const { data: existing } = await sb
           .from('employee_attendance')
           .select('id')
           .eq('user_id', user.id)
@@ -757,7 +888,7 @@ async function startServer() {
           return;
         }
 
-        const { data: inserted, error } = await supabaseAdmin
+        const { data: inserted, error } = await sb
           .from('employee_attendance')
           .insert({
             user_id: user.id,
@@ -808,8 +939,9 @@ async function startServer() {
     const nowIso = new Date().toISOString();
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { data: existing } = await supabaseAdmin
+      if (isSupabaseMode) {
+        const sb = await getSupabaseDb(req);
+        const { data: existing } = await sb
           .from('employee_attendance')
           .select('*')
           .eq('user_id', user.id)
@@ -825,7 +957,7 @@ async function startServer() {
           return;
         }
 
-        const { data: updated, error } = await supabaseAdmin
+        const { data: updated, error } = await sb
           .from('employee_attendance')
           .update({ check_out: nowIso })
           .eq('id', existing.id)
@@ -876,8 +1008,9 @@ async function startServer() {
       const q = ((req.query.q as string) || '').trim().toLowerCase();
 
       try {
-        if (isSupabaseMode && supabaseAdmin) {
-          let query = supabaseAdmin
+        if (isSupabaseMode) {
+          const sb = await getSupabaseDb(req);
+          let query = sb
             .from('students')
             .select('*')
             .order('class_name', { ascending: true })
@@ -958,8 +1091,9 @@ async function startServer() {
     }
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { data, error } = await supabaseAdmin
+      if (isSupabaseMode) {
+        const sb = await getSupabaseDb(req);
+        const { data, error } = await sb
           .from('students')
           .insert({
             nis: cleanNis,
@@ -1023,8 +1157,9 @@ async function startServer() {
     }
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { data, error } = await supabaseAdmin
+      if (isSupabaseMode) {
+        const sb = await getSupabaseDb(req);
+        const { data, error } = await sb
           .from('students')
           .update({
             nis: cleanNis,
@@ -1079,8 +1214,9 @@ async function startServer() {
     const { id } = req.params;
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { error } = await supabaseAdmin.from('students').delete().eq('id', id);
+      if (isSupabaseMode) {
+        const sb = await getSupabaseDb(req);
+        const { error } = await sb.from('students').delete().eq('id', id);
         if (error) {
           res.status(500).json({ error: error.message });
           return;
@@ -1114,8 +1250,9 @@ async function startServer() {
       const className = ((req.query.class_name as string) || '').trim();
 
       try {
-        if (isSupabaseMode && supabaseAdmin) {
-          let studentQuery = supabaseAdmin
+        if (isSupabaseMode) {
+          const sb = await getSupabaseDb(req);
+          let studentQuery = sb
             .from('students')
             .select('*')
             .order('class_name', { ascending: true })
@@ -1128,7 +1265,7 @@ async function startServer() {
             return;
           }
 
-          const { data: attRows, error: aErr } = await supabaseAdmin
+          const { data: attRows, error: aErr } = await sb
             .from('student_attendance')
             .select('*')
             .eq('attendance_date', date);
@@ -1204,7 +1341,8 @@ async function startServer() {
       const validStatuses = ['Hadir', 'Sakit', 'Izin', 'Alpa'];
 
       try {
-        if (isSupabaseMode && supabaseAdmin) {
+        if (isSupabaseMode) {
+          const sb = await getSupabaseDb(req);
           const payload = records.map((r) => ({
             student_id: r.student_id,
             attendance_date: targetDate,
@@ -1213,7 +1351,7 @@ async function startServer() {
             recorded_by: user.id,
           }));
 
-          const { error } = await supabaseAdmin
+          const { error } = await sb
             .from('student_attendance')
             .upsert(payload, { onConflict: 'student_id,attendance_date' });
 
@@ -1275,8 +1413,9 @@ async function startServer() {
       const q = ((req.query.q as string) || '').trim().toLowerCase();
 
       try {
-        if (isSupabaseMode && supabaseAdmin) {
-          let query = supabaseAdmin
+        if (isSupabaseMode) {
+          const sb = await getSupabaseDb(req);
+          let query = sb
             .from('employee_attendance')
             .select('*, profiles(full_name, email, nip, role, department)')
             .order('attendance_date', { ascending: false })
@@ -1379,8 +1518,9 @@ async function startServer() {
       const q = ((req.query.q as string) || '').trim().toLowerCase();
 
       try {
-        if (isSupabaseMode && supabaseAdmin) {
-          let query = supabaseAdmin
+        if (isSupabaseMode) {
+          const sb = await getSupabaseDb(req);
+          let query = sb
             .from('student_attendance')
             .select('*, students(id, nis, name, class_name, major), profiles(full_name)')
             .order('attendance_date', { ascending: false })
@@ -1478,10 +1618,11 @@ async function startServer() {
   // USER MANAGEMENT (ADMIN ONLY — SYNCED WITH SUPABASE AUTH + HARD DELETE)
   // ==========================================================================
 
-  app.get('/api/users', authenticateRequest, requireRole('admin'), async (_req: AuthedRequest, res: Response) => {
+  app.get('/api/users', authenticateRequest, requireRole('admin'), async (req: AuthedRequest, res: Response) => {
     try {
-      if (isSupabaseMode && supabaseAdmin) {
-        const { data, error } = await supabaseAdmin
+      if (isSupabaseMode) {
+        const sb = await getSupabaseDb(req);
+        const { data, error } = await sb
           .from('profiles')
           .select('id, email, full_name, nip, role, department, created_at')
           .order('created_at', { ascending: true });
@@ -1533,7 +1674,14 @@ async function startServer() {
     }
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
+      if (isSupabaseMode) {
+        if (!supabaseAdmin) {
+          res.status(400).json({
+            error:
+              'SUPABASE_SERVICE_ROLE_KEY belum diatur. Diperlukan Service Role Key untuk menambah user ke Supabase Authentication.',
+          });
+          return;
+        }
         const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
           email: cleanEmail,
           password,
@@ -1633,7 +1781,14 @@ async function startServer() {
     }
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
+      if (isSupabaseMode) {
+        if (!supabaseAdmin) {
+          res.status(400).json({
+            error:
+              'SUPABASE_SERVICE_ROLE_KEY belum diatur. Diperlukan Service Role Key untuk mengubah user di Supabase Authentication.',
+          });
+          return;
+        }
         const updatePayload: {
           email: string;
           password?: string;
@@ -1730,7 +1885,14 @@ async function startServer() {
     }
 
     try {
-      if (isSupabaseMode && supabaseAdmin) {
+      if (isSupabaseMode) {
+        if (!supabaseAdmin) {
+          res.status(400).json({
+            error:
+              'SUPABASE_SERVICE_ROLE_KEY belum diatur. Diperlukan Service Role Key untuk hard delete user dari Supabase Authentication.',
+          });
+          return;
+        }
         // Hard delete directly in Supabase Authentication (cascades to public.profiles)
         const { error: delAuthErr } = await supabaseAdmin.auth.admin.deleteUser(id, false);
         if (delAuthErr) {
@@ -1754,11 +1916,16 @@ async function startServer() {
     }
   });
 
+  app.all('/api/*', (req: Request, res: Response) => {
+    res.status(404).json({ error: `Endpoint tidak ditemukan: ${req.method} ${req.originalUrl}` });
+  });
+
   // ==========================================================================
   // VITE / STATIC SERVING
   // ==========================================================================
 
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

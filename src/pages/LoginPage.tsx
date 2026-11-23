@@ -4,9 +4,11 @@ import { ArrowLeft, Eye, EyeOff, Lock, Mail, User, ShieldAlert } from 'lucide-re
 import { useAuth } from '../context/AuthContext';
 
 export default function LoginPage() {
-  const { user, loading, hasUsers, login, registerFirstAdmin } = useAuth();
+  const { user, loading, hasUsers, schemaReady, schemaError, login, registerFirstAdmin } =
+    useAuth();
   const navigate = useNavigate();
 
+  const [mode, setMode] = useState<'login' | 'register'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
@@ -15,6 +17,14 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!loading && !hasUsers && schemaReady) {
+      setMode('register');
+    } else if (!loading && hasUsers) {
+      setMode('login');
+    }
+  }, [loading, hasUsers, schemaReady]);
 
   useEffect(() => {
     if (!loading && user) {
@@ -108,7 +118,50 @@ export default function LoginPage() {
 
           {/* Right Form Panel */}
           <div className="p-8 lg:col-span-7 lg:p-10">
-            {!hasUsers ? (
+            {!schemaReady && (
+              <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 p-3.5 text-xs leading-relaxed text-amber-900">
+                <p className="font-semibold">Info Koneksi Admin Supabase</p>
+                <p className="mt-1">
+                  {schemaError || 'Kunci admin Supabase belum aktif penuh.'} Anda tetap dapat
+                  langsung login menggunakan akun yang sudah dibuat di Supabase Authentication.
+                </p>
+              </div>
+            )}
+
+            {!hasUsers && (
+              <div className="mb-6 inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setError('');
+                    setMode('login');
+                  }}
+                  className={`rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                    mode === 'login'
+                      ? 'bg-red-600 text-white'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Masuk Akun
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setError('');
+                    setMode('register');
+                  }}
+                  className={`rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                    mode === 'register'
+                      ? 'bg-red-600 text-white'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Buat Admin Pertama
+                </button>
+              </div>
+            )}
+
+            {mode === 'register' && !hasUsers ? (
               <>
                 <div className="mb-6">
                   <p className="text-xs font-semibold text-red-600">Aktivasi Sistem Awal</p>

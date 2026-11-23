@@ -122,6 +122,10 @@ create policy "Users can view own profile or admin views all"
   on public.profiles for select
   using (auth.uid() = id or public.current_user_role() = 'admin');
 
+create policy "Users can insert own profile"
+  on public.profiles for insert
+  with check (auth.uid() = id);
+
 create policy "Only admin can manage profiles directly"
   on public.profiles for all
   using (public.current_user_role() = 'admin')
@@ -155,3 +159,15 @@ create policy "Admin and guru manage student attendance"
   on public.student_attendance for all
   using (public.current_user_role() in ('admin', 'guru'))
   with check (public.current_user_role() in ('admin', 'guru'));
+
+-- 7. Explicit Schema & Table Grants for Supabase roles
+grant usage on schema public to anon, authenticated, service_role;
+grant all on table public.profiles to service_role;
+grant all on table public.students to service_role;
+grant all on table public.employee_attendance to service_role;
+grant all on table public.student_attendance to service_role;
+grant select, insert, update, delete on table public.profiles to authenticated;
+grant select, insert, update, delete on table public.students to authenticated;
+grant select, insert, update, delete on table public.employee_attendance to authenticated;
+grant select, insert, update, delete on table public.student_attendance to authenticated;
+
