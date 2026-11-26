@@ -1,7 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { apiFetch, getAuthToken, setAuthToken } from '../lib/api';
 import { isClientSupabaseConfigured, supabaseClient } from '../lib/supabase';
-import type { UserProfile, UserRole } from '../types';
+import type { UserProfile } from '../types';
 
 interface BootstrapStatus {
   hasUsers: boolean;
@@ -93,46 +93,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
-    try {
-      const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ email, password }),
-      });
-      setAuthToken(res.token);
-      setUser(res.user);
-      setHasUsers(true);
-      return res.user;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '';
-      if (msg.includes('404') && isClientSupabaseConfigured && supabaseClient) {
-        const { data, error } = await supabaseClient.auth.signInWithPassword({
-          email: email.trim().toLowerCase(),
-          password,
-        });
-        if (error || !data.session || !data.user) {
-          throw new Error(error?.message || 'Email atau password salah.');
-        }
-        const meta = (data.user.user_metadata || {}) as Record<string, string>;
-        const role: UserRole =
-          meta.role === 'admin' || meta.role === 'guru' || meta.role === 'tenaga_kependidikan'
-            ? meta.role
-            : 'admin';
-        const profile: UserProfile = {
-          id: data.user.id,
-          email: data.user.email || email,
-          full_name: meta.full_name || (data.user.email || email).split('@')[0],
-          nip: meta.nip || '',
-          role,
-          department: meta.department || '',
-          created_at: data.user.created_at || new Date().toISOString(),
-        };
-        setAuthToken(data.session.access_token);
-        setUser(profile);
-        setHasUsers(true);
-        return profile;
-      }
-      throw err;
+    const res = await apiFetch<{ token: string; user: UserProfile }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+    setAuthToken(res.token);
+    if (isClientSupabaseConfigured && supabaseClient) {
+      await supabaseClient.auth.signInWithPassword({
+        email: email.trim().toLowerCase(),
+        password,
+      }).catch(() => {});
     }
+    setUser(res.user);
+    setHasUsers(true);
+    return res.user;
   }, []);
 
   const registerFirstAdmin = useCallback(
@@ -160,6 +134,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       await apiFetch('/api/auth/logout', { method: 'POST' });
     } catch {
       // ignore network error during logout
+    }
+    if (isClientSupabaseConfigured && supabaseClient) {
+      await supabaseClient.auth.signOut().catch(() => {});
     }
     setAuthToken(null);
     setUser(null);

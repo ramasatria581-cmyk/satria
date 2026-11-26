@@ -378,6 +378,9 @@ async function startServer() {
   app.get('/api/auth/bootstrap-status', async (_req: Request, res: Response) => {
     try {
       if (isSupabaseMode) {
+        let adminErrorDetail = '';
+        let authAdminErrorDetail = '';
+
         if (supabaseAdmin) {
           const { count, error } = await supabaseAdmin
             .from('profiles')
@@ -390,15 +393,45 @@ async function startServer() {
             return;
           }
           adminDbWorks = false;
+          adminErrorDetail = error.message || error.code || 'unknown db error';
+
+          const { error: authErr } = await supabaseAdmin.auth.admin.listUsers({
+            page: 1,
+            perPage: 1,
+          });
+          if (authErr) {
+            authAdminErrorDetail = authErr.message || 'unknown auth admin error';
+          }
+        }
+
+        const keyHint = !SUPABASE_SERVICE_ROLE_KEY
+          ? 'kosong'
+          : SUPABASE_SERVICE_ROLE_KEY === SUPABASE_ANON_KEY
+            ? 'sama dengan ANON_KEY'
+            : SUPABASE_SERVICE_ROLE_KEY.startsWith('sb_publishable_')
+              ? 'menggunakan sb_publishable_ (bukan service_role / sb_secret_)'
+              : SUPABASE_SERVICE_ROLE_KEY.startsWith('eyJ')
+                ? 'format JWT'
+                : 'format kustom';
+
+        let schemaError = 'SUPABASE_SERVICE_ROLE_KEY belum diatur di Secrets.';
+        if (supabaseAdmin) {
+          if (SUPABASE_SERVICE_ROLE_KEY === SUPABASE_ANON_KEY) {
+            schemaError =
+              'SUPABASE_SERVICE_ROLE_KEY bernilai sama dengan SUPABASE_ANON_KEY. Ganti dengan service_role secret key dari Supabase Dashboard → Project Settings → API.';
+          } else if (SUPABASE_SERVICE_ROLE_KEY.startsWith('sb_publishable_')) {
+            schemaError =
+              'SUPABASE_SERVICE_ROLE_KEY terisi publishable key (sb_publishable_...). Ganti dengan service_role / secret key dari Supabase Dashboard → Project Settings → API.';
+          } else {
+            schemaError = `Koneksi admin Supabase gagal (DB: ${adminErrorDetail || '-'}; Auth: ${authAdminErrorDetail || 'OK'}). Key: ${keyHint}.`;
+          }
         }
 
         res.json({
           hasUsers: false,
           provider: 'supabase',
-          schemaReady: Boolean(supabaseAdmin && adminDbWorks),
-          schemaError: !supabaseAdmin
-            ? 'SUPABASE_SERVICE_ROLE_KEY belum diatur di Secrets.'
-            : 'SUPABASE_SERVICE_ROLE_KEY tidak memiliki akses admin Auth/Database atau tabel profiles belum siap.',
+          schemaReady: false,
+          schemaError,
         });
         return;
       }
